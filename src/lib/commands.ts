@@ -15,6 +15,7 @@ export const COMMANDS: Command[] = [
   { name: "/keys", description: "Show keyboard shortcuts" },
   { name: "/load", description: "Load a saved conversation. /load to list" },
   { name: "/model", description: "Show or switch model. /model <name> to switch" },
+  { name: "/mood", description: "Set personality mood. /mood <name> or /mood off" },
   {
     name: "/permissions",
     description: "Manage tool permissions. /permissions <tool> <always|ask|never>",

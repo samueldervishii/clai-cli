@@ -8,6 +8,7 @@ const TOOL_LABELS: Record<string, string> = {
   list_dir: "List",
   search_files: "Search",
   write_file: "Write",
+  run_command: "Run",
 };
 
 interface MessageProps {
@@ -38,7 +39,11 @@ export function Message({ message }: MessageProps) {
               );
             }
             const label = TOOL_LABELS[seg.name] ?? seg.name;
-            const target = (seg.input.path as string) ?? (seg.input.pattern as string) ?? "";
+            const target =
+              (seg.input.path as string) ??
+              (seg.input.pattern as string) ??
+              (seg.input.command as string) ??
+              "";
             return (
               <Text key={i} color={theme.dim} dimColor>
                 {seg.isError ? "✗" : "✓"} {label} {target}
@@ -51,7 +56,9 @@ export function Message({ message }: MessageProps) {
               <Text color={theme.dim}>[image attached]</Text>
             ) : null}
             <Text color={isUser ? undefined : theme.assistantColor} wrap="wrap">
-              {isUser ? message.content : renderMarkdown(message.content)}
+              {isUser || message.id.startsWith("system-")
+                ? message.content
+                : renderMarkdown(message.content)}
             </Text>
           </>
         )}

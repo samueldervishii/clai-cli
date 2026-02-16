@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ClaiConfig, ToolPermission } from "./types.js";
 
 const CONFIG_DIR = resolve(
@@ -54,7 +55,10 @@ export function loadConfig(): ClaiConfig {
 export function saveConfig(config: ClaiConfig): boolean {
   try {
     mkdirSync(CONFIG_DIR, { recursive: true });
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+    // Atomic write: write to temp file then rename to prevent partial writes
+    const tmpPath = join(CONFIG_DIR, `.config-${randomUUID()}.tmp`);
+    writeFileSync(tmpPath, JSON.stringify(config, null, 2) + "\n");
+    renameSync(tmpPath, CONFIG_PATH);
     return true;
   } catch {
     return false;

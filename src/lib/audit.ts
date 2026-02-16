@@ -12,12 +12,25 @@ const CONFIG_DIR = resolve(
 const AUDIT_LOG_PATH = resolve(CONFIG_DIR, "audit.log");
 
 export interface AuditEntry {
-  timestamp: string;
   action: "tool_call" | "tool_approved" | "tool_denied" | "sensitive_file_access";
   toolName: string;
   input: Record<string, unknown>;
   result?: "success" | "error" | "denied";
   details?: string;
+}
+
+/** Redact credentials from URLs and sensitive values in audit inputs */
+function sanitizeInput(input: Record<string, unknown>): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string") {
+      // Redact credentials in URLs (user:pass@host)
+      sanitized[key] = value.replace(/:\/\/[^@/]+@/g, "://[REDACTED]@");
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
 }
 
 /**
@@ -32,14 +45,17 @@ export function logAudit(entry: AuditEntry): void {
 
     // Format as JSON for easy parsing
     const line = JSON.stringify({
-      ...entry,
       timestamp: new Date().toISOString(),
+      action: entry.action,
+      toolName: entry.toolName,
+      input: sanitizeInput(entry.input),
+      ...(entry.result ? { result: entry.result } : {}),
+      ...(entry.details ? { details: entry.details } : {}),
     });
 
     appendFileSync(AUDIT_LOG_PATH, line + "\n", { mode: 0o600 });
-  } catch (error) {
+  } catch {
     // Don't throw - audit logging failure shouldn't break the app
-    console.error("Audit log error:", error);
   }
 }
 
@@ -48,7 +64,6 @@ export function logAudit(entry: AuditEntry): void {
  */
 export function logToolCall(toolName: string, input: Record<string, unknown>): void {
   logAudit({
-    timestamp: new Date().toISOString(),
     action: "tool_call",
     toolName,
     input,
@@ -65,7 +80,6 @@ export function logToolApproved(
   details?: string,
 ): void {
   logAudit({
-    timestamp: new Date().toISOString(),
     action: "tool_approved",
     toolName,
     input,
@@ -79,7 +93,6 @@ export function logToolApproved(
  */
 export function logToolDenied(toolName: string, input: Record<string, unknown>): void {
   logAudit({
-    timestamp: new Date().toISOString(),
     action: "tool_denied",
     toolName,
     input,
@@ -96,7 +109,6 @@ export function logSensitiveFileAccess(
   approved: boolean,
 ): void {
   logAudit({
-    timestamp: new Date().toISOString(),
     action: "sensitive_file_access",
     toolName,
     input: { path: filePath },

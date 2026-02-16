@@ -7,6 +7,7 @@ export interface RetryOptions {
   initialDelay?: number; // ms
   maxDelay?: number; // ms
   backoffMultiplier?: number;
+  signal?: AbortSignal;
   onRetry?: (attempt: number, delay: number, error: unknown) => void;
 }
 
@@ -82,16 +83,27 @@ export async function retryWithBackoff<T>(
     initialDelay = 1000,
     maxDelay = 30000,
     backoffMultiplier = 2,
+    signal,
     onRetry,
   } = options;
 
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    // Don't retry if aborted
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException("Aborted", "AbortError");
+    }
+
     try {
       return await fn();
     } catch (error) {
       lastError = error;
+
+      // Don't retry if aborted
+      if (signal?.aborted) {
+        throw error;
+      }
 
       // Don't retry if not a retryable error
       if (!isRetryableError(error)) {

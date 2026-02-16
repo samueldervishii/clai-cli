@@ -34,6 +34,11 @@ function getClient(): OpenAI {
   return _client;
 }
 
+/** Reset cached client (e.g. after API key change) */
+export function resetGroqClient(): void {
+  _client = null;
+}
+
 // Convert Anthropic tool format to OpenAI format
 function convertToolsToOpenAI(): ChatCompletionTool[] {
   return TOOL_DEFINITIONS.map((tool) => ({
@@ -98,6 +103,9 @@ export class GroqProvider implements AIProvider {
     let finalText = "";
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // Check if aborted before starting a new round
+      if (signal?.aborted) break;
+
       let stream: AsyncIterable<ChatCompletionChunk>;
 
       try {
@@ -117,6 +125,7 @@ export class GroqProvider implements AIProvider {
           {
             maxRetries: 2,
             initialDelay: 1000,
+            signal,
             onRetry: (attempt, delay) => {
               console.error(`Retrying API call (attempt ${attempt}) after ${delay}ms...`);
             },
@@ -139,15 +148,20 @@ export class GroqProvider implements AIProvider {
 
       let currentToolCalls: Record<number, { id: string; name: string; arguments: string }> = {};
       let stopReason: string | null = null;
+      let roundInputTokens = 0;
+      let roundOutputTokens = 0;
 
       for await (const chunk of stream as AsyncIterable<ChatCompletionChunk>) {
+        if (signal?.aborted) break;
+
         const choice = chunk.choices[0];
         if (!choice) continue;
 
-        // Track token usage (Groq includes usage in final chunk)
+        // Track token usage — Groq may send usage in multiple chunks per round,
+        // so take the latest value (not cumulative) to avoid double-counting
         if (chunk.usage) {
-          totalInputTokens += chunk.usage.prompt_tokens ?? 0;
-          totalOutputTokens += chunk.usage.completion_tokens ?? 0;
+          roundInputTokens = chunk.usage.prompt_tokens ?? 0;
+          roundOutputTokens = chunk.usage.completion_tokens ?? 0;
         }
 
         // Handle text deltas
@@ -177,6 +191,10 @@ export class GroqProvider implements AIProvider {
           stopReason = choice.finish_reason;
         }
       }
+
+      // Add this round's token usage to totals
+      totalInputTokens += roundInputTokens;
+      totalOutputTokens += roundOutputTokens;
 
       // Execute tool calls
       const toolResults: ChatCompletionMessageParam[] = [];
@@ -231,8 +249,11 @@ export class GroqProvider implements AIProvider {
           // Check if tool requires approval based on permission setting and content
           let needsApproval = permission === "ask";
 
-          // For write_file, always require approval unless permission is "always"
-          if (toolCall.name === "write_file" && permission !== "always") {
+          // For write_file and run_command, always require approval unless permission is "always"
+          if (
+            (toolCall.name === "write_file" || toolCall.name === "run_command") &&
+            permission !== "always"
+          ) {
             needsApproval = true;
           }
 
@@ -265,10 +286,15 @@ export class GroqProvider implements AIProvider {
                 logSensitiveFileAccess(toolCall.name, toolInput.path, false);
               }
 
-              const action = toolCall.name === "write_file" ? "write" : "read";
+              const action =
+                toolCall.name === "write_file"
+                  ? "file write"
+                  : toolCall.name === "run_command"
+                    ? "command execution"
+                    : "file read";
               toolResults.push({
                 role: "tool",
-                content: `User denied this file ${action}.`,
+                content: `User denied this ${action}.`,
                 tool_call_id: toolCall.id,
               });
               yield {

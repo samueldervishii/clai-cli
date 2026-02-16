@@ -3,8 +3,8 @@
  * Routes requests to appropriate provider (Anthropic or Groq)
  */
 
-import { AnthropicProvider } from "./provider-anthropic.js";
-import { GroqProvider } from "./provider-groq.js";
+import { AnthropicProvider, resetAnthropicClient } from "./provider-anthropic.js";
+import { GroqProvider, resetGroqClient } from "./provider-groq.js";
 import type { ChatMessage, StreamEvent } from "./types.js";
 import {
   MODELS,
@@ -69,6 +69,14 @@ export async function* streamChat(
   }
 
   return yield* provider.streamChat(messages, modelId, maxTokens, systemPrompt, signal);
+}
+
+/**
+ * Reset cached provider clients (call after API key changes or model switches)
+ */
+export function resetClients(): void {
+  resetAnthropicClient();
+  resetGroqClient();
 }
 
 /**

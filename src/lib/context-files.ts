@@ -2,8 +2,11 @@
  * Project context file support (.claicontext and .claiignore)
  */
 
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+
+// Max .claicontext size: 5KB (prevents oversized context and prompt injection)
+const MAX_CONTEXT_FILE_SIZE = 5 * 1024;
 
 /**
  * Load .claicontext file from current working directory
@@ -17,6 +20,15 @@ export function loadContextFile(): string | null {
   }
 
   try {
+    // Enforce file size limit
+    const stat = statSync(contextPath);
+    if (stat.size > MAX_CONTEXT_FILE_SIZE) {
+      console.error(
+        `.claicontext too large (${Math.round(stat.size / 1024)}KB, max ${MAX_CONTEXT_FILE_SIZE / 1024}KB) — skipped`,
+      );
+      return null;
+    }
+
     const content = readFileSync(contextPath, "utf-8").trim();
     if (!content) return null;
 

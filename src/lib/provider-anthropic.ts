@@ -29,6 +29,11 @@ function getClient(): Anthropic {
   return _client;
 }
 
+/** Reset cached client (e.g. after API key change) */
+export function resetAnthropicClient(): void {
+  _client = null;
+}
+
 const MAX_TOOL_ROUNDS = 10;
 
 export class AnthropicProvider implements AIProvider {
@@ -70,6 +75,9 @@ export class AnthropicProvider implements AIProvider {
     let finalText = "";
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      // Check if aborted before starting a new round
+      if (signal?.aborted) break;
+
       let stream: AsyncIterable<RawMessageStreamEvent>;
 
       try {
@@ -90,6 +98,7 @@ export class AnthropicProvider implements AIProvider {
           {
             maxRetries: 2,
             initialDelay: 1000,
+            signal,
             onRetry: (attempt, delay) => {
               // Note: Can't yield from inside retry callback
               console.error(`Retrying API call (attempt ${attempt}) after ${delay}ms...`);
@@ -116,6 +125,8 @@ export class AnthropicProvider implements AIProvider {
       let stopReason: string | null = null;
 
       for await (const event of stream as AsyncIterable<RawMessageStreamEvent>) {
+        if (signal?.aborted) break;
+
         switch (event.type) {
           case "message_start":
             totalInputTokens += event.message.usage.input_tokens;
@@ -197,8 +208,11 @@ export class AnthropicProvider implements AIProvider {
           // Check if tool requires approval based on permission setting and content
           let needsApproval = permission === "ask";
 
-          // For write_file, always require approval unless permission is "always"
-          if (block.name === "write_file" && permission !== "always") {
+          // For write_file and run_command, always require approval unless permission is "always"
+          if (
+            (block.name === "write_file" || block.name === "run_command") &&
+            permission !== "always"
+          ) {
             needsApproval = true;
           }
 
@@ -231,11 +245,16 @@ export class AnthropicProvider implements AIProvider {
                 logSensitiveFileAccess(block.name, toolInput.path, false);
               }
 
-              const action = block.name === "write_file" ? "write" : "read";
+              const action =
+                block.name === "write_file"
+                  ? "file write"
+                  : block.name === "run_command"
+                    ? "command execution"
+                    : "file read";
               toolResults.push({
                 type: "tool_result",
                 tool_use_id: block.id,
-                content: `User denied this file ${action}.`,
+                content: `User denied this ${action}.`,
                 is_error: true,
               });
               yield {

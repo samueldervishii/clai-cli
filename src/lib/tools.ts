@@ -91,6 +91,21 @@ export const TOOL_DEFINITIONS: Anthropic.Tool[] = [
       required: ["url"],
     },
   },
+  {
+    name: "run_command",
+    description:
+      "Execute a shell command in the working directory. Returns stdout and stderr. Use this for running tests, linters, builds, git commands, etc. Some commands are blocked for security (network, privilege escalation, destructive). Requires user approval by default.",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        command: {
+          type: "string",
+          description: "The shell command to execute",
+        },
+      },
+      required: ["command"],
+    },
+  },
 ];
 
 export interface ToolResult {
@@ -132,6 +147,11 @@ export function executeTool(
         return { output: "Missing or invalid 'url'", isError: true };
       }
       return webFetch(input.url);
+    }
+    case "run_command": {
+      if (typeof input.command !== "string")
+        return { output: "Missing or invalid 'command'", isError: true };
+      return runCommand(input.command);
     }
     default:
       return { output: `Unknown tool: ${name}`, isError: true };
@@ -315,6 +335,98 @@ function writeFile(filePath: string, content: string): ToolResult {
   }
 }
 
+// Commands that are always blocked regardless of permission settings
+const BLOCKED_COMMAND_PATTERNS = [
+  // Destructive
+  /\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+-[a-zA-Z]*r|(-[a-zA-Z]*r[a-zA-Z]*\s+-[a-zA-Z]*f))\b/, // rm -rf variants
+  /\brm\s+-[a-zA-Z]*rf\b/, // rm -rf combined
+  /\bmkfs\b/,
+  /\bdd\s+if=/,
+  // Privilege escalation
+  /\bsudo\b/,
+  /\bsu\s/,
+  /\bchmod\b/,
+  /\bchown\b/,
+  // Network / exfiltration
+  /\bcurl\b/,
+  /\bwget\b/,
+  /\bnc\s/,
+  /\bncat\b/,
+  /\bssh\b/,
+  /\bscp\b/,
+  /\brsync\b/,
+  // System
+  /\bshutdown\b/,
+  /\breboot\b/,
+  /\bhalt\b/,
+  /\bpoweroff\b/,
+  /\binit\s+[0-6]\b/,
+  // Backgrounding
+  /&\s*$/,
+  /\bnohup\b/,
+  /\bdisown\b/,
+];
+
+const MAX_COMMAND_TIMEOUT = 30_000; // 30 seconds
+const MAX_OUTPUT_SIZE = 10_000; // 10KB output cap
+
+function runCommand(command: string): ToolResult {
+  const trimmed = command.trim();
+  if (!trimmed) {
+    return { output: "Empty command", isError: true };
+  }
+
+  // Check against blocked patterns
+  for (const pattern of BLOCKED_COMMAND_PATTERNS) {
+    if (pattern.test(trimmed)) {
+      return {
+        output: `Command blocked for security: matches restricted pattern. Blocked categories: destructive ops, privilege escalation, network access, backgrounding.`,
+        isError: true,
+      };
+    }
+  }
+
+  const cwd = getWorkingDirectory();
+
+  try {
+    const result = execSync(trimmed, {
+      cwd,
+      encoding: "utf-8",
+      timeout: MAX_COMMAND_TIMEOUT,
+      maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const output =
+      result.length > MAX_OUTPUT_SIZE
+        ? result.slice(0, MAX_OUTPUT_SIZE) + "\n\n[Output truncated at 10KB]"
+        : result;
+
+    return { output: output || "(no output)", isError: false };
+  } catch (err: unknown) {
+    if (err && typeof err === "object" && "killed" in err && (err as { killed: boolean }).killed) {
+      return { output: `Command timed out after ${MAX_COMMAND_TIMEOUT / 1000}s`, isError: true };
+    }
+    // execSync throws on non-zero exit — capture stderr/stdout from the error
+    if (err && typeof err === "object" && "stderr" in err) {
+      const execErr = err as { stdout?: string; stderr?: string; status?: number };
+      const stderr = typeof execErr.stderr === "string" ? execErr.stderr : "";
+      const stdout = typeof execErr.stdout === "string" ? execErr.stdout : "";
+      const combined = (stdout + "\n" + stderr).trim();
+      const output =
+        combined.length > MAX_OUTPUT_SIZE
+          ? combined.slice(0, MAX_OUTPUT_SIZE) + "\n\n[Output truncated at 10KB]"
+          : combined;
+      return {
+        output: `Exit code ${execErr.status ?? 1}:\n${output || "(no output)"}`,
+        isError: true,
+      };
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return { output: `Command failed: ${msg}`, isError: true };
+  }
+}
+
 function webFetch(url: string): ToolResult {
   let parsed: URL;
   try {
@@ -334,14 +446,18 @@ function webFetch(url: string): ToolResult {
   const hostname = parsed.hostname.toLowerCase();
   const privatePatterns = [
     /^localhost$/i,
-    /^127\./,
-    /^10\./,
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
-    /^192\.168\./,
+    /^127\./, // IPv4 loopback
+    /^0\./, // 0.0.0.0/8
+    /^10\./, // 10.0.0.0/8
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./, // 172.16.0.0/12
+    /^192\.168\./, // 192.168.0.0/16
     /^169\.254\./, // link-local
+    /^255\.255\.255\.255$/, // broadcast
     /^::1$/, // IPv6 localhost
+    /^\[::1\]$/, // IPv6 localhost bracketed
     /^fe80:/i, // IPv6 link-local
-    /^fc00:/i, // IPv6 private
+    /^fc00:/i, // IPv6 unique local (fc00::/7)
+    /^fd[0-9a-f]{2}:/i, // IPv6 unique local (fd00::/8)
   ];
 
   if (privatePatterns.some((pattern) => pattern.test(hostname))) {

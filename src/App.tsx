@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { randomUUID } from "node:crypto";
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { resolve, extname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Box, useApp, useInput, useStdout } from "ink";
@@ -10,7 +10,7 @@ import { MessageList } from "./components/MessageList.js";
 import { InputBar } from "./components/InputBar.js";
 import { StatusBar } from "./components/StatusBar.js";
 import { CommandSuggestions } from "./components/CommandSuggestions.js";
-import { streamChat, MODELS, MODEL_DISPLAY, DEFAULT_MODEL } from "./lib/claude.js";
+import { streamChat, MODELS, MODEL_DISPLAY, DEFAULT_MODEL, resetClients } from "./lib/claude.js";
 import { filterCommands } from "./lib/commands.js";
 import {
   loadConfig,
@@ -38,6 +38,7 @@ const HELP_TEXT = `Available commands:
   /keys        — Show keyboard shortcuts
   /load        — Load a saved conversation. /load to list
   /model       — Show or switch model. /model <name> to switch
+  /mood        — Set personality mood. /mood <pirate|formal|sarcastic|...>
   /permissions — Manage tool permissions. /permissions <tool> <always|ask|never>
   /preset      — System prompt presets. /preset <name> or /preset save <name>
   /restore     — Restore a session. /restore to list, /restore <name>
@@ -47,8 +48,69 @@ const HELP_TEXT = `Available commands:
   /tokens      — Show token usage and cost details
   /web         — Fetch and summarize a URL. Usage: /web <url>
 
-Clai can also read, search, list, and write files in your working directory.
-Just ask it to look at your code!`;
+Clai can also read, search, list, write files, and run commands in your working directory.
+Just ask it to look at your code or run your tests!`;
+
+const MOOD_PRESETS: Record<string, string> = {
+  pirate:
+    "Respond as a pirate. Use pirate slang, say 'arr', 'matey', 'ye', 'shiver me timbers', etc. Stay helpful but always in character.",
+  formal:
+    "Respond in an extremely formal, professional tone. Use sophisticated vocabulary, proper titles, and elaborate courtesy. Like a Victorian-era butler.",
+  sarcastic:
+    "Respond with dry, witty sarcasm. Be helpful but pepper every answer with sardonic humor and eye-roll-worthy remarks.",
+  eli5: "Explain everything like I'm 5 years old. Use simple words, fun analogies, and be enthusiastic. No jargon.",
+  zen: "Respond like a calm zen master. Use short, contemplative sentences. Include occasional wisdom metaphors. Be peaceful and mindful.",
+  excited:
+    "Respond with EXTREME enthusiasm!! Use lots of exclamation marks! Everything is amazing and fascinating! Be genuinely hyped about every topic!",
+  noir: "Respond like a 1940s film noir detective. Use moody, atmospheric language. The code is the case. The bugs are the suspects. It was a dark and stormy compile.",
+  shakespearean:
+    "Respond in Shakespearean English. Use thee, thou, hath, doth, forsooth, etc. Dramatic monologues encouraged. All the world's a terminal.",
+};
+
+function checkEasterEgg(input: string): string | null {
+  const lower = input.toLowerCase().trim();
+
+  if (lower === "hello world") return 'printf("Hello, World!\\n"); // Classic.';
+  if (lower === "sudo make me a sandwich")
+    return [
+      "Okay.",
+      "    ___________",
+      "   /           \\",
+      "  |  ~  ~  ~  ~ |",
+      "  |  =========  |",
+      "  |  ~  ~  ~  ~ |",
+      "   \\___________/",
+      "",
+      "One sandwich, made with root privileges.",
+    ].join("\n");
+  if (lower === "/cowsay" || lower === "cowsay")
+    return [
+      " _________",
+      "< Moo!    >",
+      " ---------",
+      "        \\   ^__^",
+      "         \\  (oo)\\_______",
+      "            (__)\\       )\\/\\",
+      "                ||----w |",
+      "                ||     ||",
+    ].join("\n");
+  if (lower === "42")
+    return "The Answer to the Ultimate Question of Life, the Universe, and Everything.";
+  if (lower === "/flip" || lower === "flip table" || lower === "tableflip") return "(╯°□°)╯︵ ┻━┻";
+  if (lower === "/unflip" || lower === "unflip") return "┬─┬ノ( º _ ºノ)  There, there.";
+  if (lower === "/shrug" || lower === "shrug") return "¯\\_(ツ)_/¯";
+  if (lower === "i am groot") return "I am Clai.";
+  if (lower === "ping") return "pong";
+  if (lower === "marco") return "Polo!";
+  if (lower === "hello there") return "General Kenobi!";
+  if (lower === "/lenny") return "( ͡° ͜ʖ ͡°)";
+  if (lower === "xyzzy")
+    return "Nothing happens. (But you clearly have good taste in adventure games.)";
+  if (lower === "up up down down left right left right b a")
+    return "Unlimited tokens activated! (just kidding)";
+
+  return null;
+}
 
 const IMAGE_EXTENSIONS: Record<string, string> = {
   ".jpg": "image/jpeg",
@@ -96,8 +158,10 @@ export function App({ initialMessage }: AppProps) {
     outputTokens: 0,
     totalCost: 0,
   });
+  const [currentMood, setCurrentMood] = useState<string | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const savedInputRef = useRef("");
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
   const sessionIdRef = useRef<string | null>(null);
@@ -125,9 +189,9 @@ export function App({ initialMessage }: AppProps) {
     [getSessionId],
   );
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom only if user is already at the bottom
   useEffect(() => {
-    setScrollOffset(0);
+    setScrollOffset((prev) => (prev === 0 ? 0 : prev + 1));
   }, [messages.length]);
 
   // Handle piped stdin input
@@ -175,7 +239,11 @@ export function App({ initialMessage }: AppProps) {
       }
       // Up/down arrows: input history only
       if (key.upArrow) {
-        if (inputHistory.length > 0 && (!inputValue || historyIndex >= 0)) {
+        if (inputHistory.length > 0) {
+          if (historyIndex < 0) {
+            // Entering history mode — save current input
+            savedInputRef.current = inputValue;
+          }
           const newIdx = Math.min(historyIndex + 1, inputHistory.length - 1);
           setHistoryIndex(newIdx);
           setInputValue(inputHistory[newIdx]!);
@@ -184,7 +252,8 @@ export function App({ initialMessage }: AppProps) {
       if (key.downArrow && historyIndex >= 0) {
         const newIdx = historyIndex - 1;
         setHistoryIndex(newIdx);
-        setInputValue(newIdx >= 0 ? inputHistory[newIdx]! : "");
+        // Restore saved input when leaving history mode
+        setInputValue(newIdx >= 0 ? inputHistory[newIdx]! : savedInputRef.current);
       }
     }
   });
@@ -231,11 +300,19 @@ export function App({ initialMessage }: AppProps) {
       const localSegments: MessageSegment[] = [];
 
       try {
+        // Prepend mood personality to system prompt if active
+        const effectivePrompt =
+          currentMood && MOOD_PRESETS[currentMood]
+            ? systemPrompt
+              ? `${MOOD_PRESETS[currentMood]}\n\n${systemPrompt}`
+              : MOOD_PRESETS[currentMood]
+            : systemPrompt;
+
         const generator = streamChat(
           chatMessages,
           currentModel,
           maxTokens,
-          systemPrompt,
+          effectivePrompt,
           abortController.signal,
         );
 
@@ -266,10 +343,15 @@ export function App({ initialMessage }: AppProps) {
             }
             setStreamSegments([...localSegments]);
           } else if (event.type === "tool_approve") {
-            const path = event.tool.input.path as string;
-            const content = event.tool.input.content as string;
-            const preview = content.length > 200 ? content.slice(0, 200) + "..." : content;
-            addSystemMessage(`Write file: ${path}\n\n${preview}\n\nApproved automatically.`);
+            if (event.tool.name === "run_command") {
+              const cmd = event.tool.input.command as string;
+              addSystemMessage(`Run command: ${cmd}\n\nApproved automatically.`);
+            } else {
+              const path = event.tool.input.path as string;
+              const content = event.tool.input.content as string;
+              const preview = content.length > 200 ? content.slice(0, 200) + "..." : content;
+              addSystemMessage(`Write file: ${path}\n\n${preview}\n\nApproved automatically.`);
+            }
             event.approve();
           } else if (event.type === "warning") {
             setError(event.message);
@@ -279,22 +361,27 @@ export function App({ initialMessage }: AppProps) {
         }
 
         const { usage } = result.value;
-        const newTotalUsage = {
-          inputTokens: totalUsage.inputTokens + usage.inputTokens,
-          outputTokens: totalUsage.outputTokens + usage.outputTokens,
-          totalCost: totalUsage.totalCost + usage.totalCost,
-        };
-        setTotalUsage(newTotalUsage);
+        let newTotalUsage: TokenUsage | undefined;
+        setTotalUsage((prev) => {
+          newTotalUsage = {
+            inputTokens: prev.inputTokens + usage.inputTokens,
+            outputTokens: prev.outputTokens + usage.outputTokens,
+            totalCost: prev.totalCost + usage.totalCost,
+          };
+          return newTotalUsage;
+        });
         addLifetimeSpend(usage.totalCost);
 
         // Check context limit and warn if approaching threshold
-        const { checkContextLimit } = await import("./lib/providers.js");
-        const contextWarning = checkContextLimit(
-          currentModel,
-          newTotalUsage.inputTokens + newTotalUsage.outputTokens,
-        );
-        if (contextWarning) {
-          setInfo(contextWarning);
+        if (newTotalUsage) {
+          const { checkContextLimit } = await import("./lib/providers.js");
+          const contextWarning = checkContextLimit(
+            currentModel,
+            newTotalUsage.inputTokens + newTotalUsage.outputTokens,
+          );
+          if (contextWarning) {
+            setInfo(contextWarning);
+          }
         }
 
         return { text: fullResponse, segments: localSegments };
@@ -325,7 +412,7 @@ export function App({ initialMessage }: AppProps) {
         setAppState("idle");
       }
     },
-    [currentModel, systemPrompt],
+    [currentModel, systemPrompt, currentMood],
   );
 
   const handleSubmit = useCallback(
@@ -357,6 +444,7 @@ export function App({ initialMessage }: AppProps) {
       setError(undefined);
       setInfo(undefined);
       setHistoryIndex(-1);
+      setScrollOffset(0); // Always scroll to bottom on submit
       setInputHistory((prev) => [value.trim(), ...prev.slice(0, 99)]); // Store original, not normalized
 
       // === Commands ===
@@ -379,7 +467,8 @@ export function App({ initialMessage }: AppProps) {
               .slice(0, 10)
               .map((c) => `  - ${c}`)
               .join("\n");
-            addSystemMessage(`Available sessions:\n${list}\n\nUse /restore <name>`);
+            const more = convos.length > 10 ? `\n  ... and ${convos.length - 10} more` : "";
+            addSystemMessage(`Available sessions:\n${list}${more}\n\nUse /restore <name>`);
           }
           return;
         }
@@ -392,6 +481,14 @@ export function App({ initialMessage }: AppProps) {
         setMessages(loaded);
         setTotalUsage({ inputTokens: 0, outputTokens: 0, totalCost: 0 });
         sessionIdRef.current = null;
+        // Restore the model from the last assistant message
+        const lastAssistantModel = [...loaded]
+          .reverse()
+          .find((m) => m.role === "assistant" && m.model)?.model;
+        if (lastAssistantModel) {
+          setCurrentModel(lastAssistantModel);
+          resetClients();
+        }
         setInfo("session restored");
         return;
       }
@@ -513,6 +610,7 @@ Cost Breakdown
         }
 
         setCurrentModel(modelConfig.id);
+        resetClients(); // Clear cached client so new provider/key is used
         addSystemMessage(`Switched to ${modelConfig.displayName}`);
         return;
       }
@@ -577,7 +675,10 @@ Cost Breakdown
               .slice(0, 10)
               .map((c) => `  ${c}`)
               .join("\n");
-            addSystemMessage(`Saved conversations:\n${list}\n\nUse /load <name> to restore.`);
+            const more = convos.length > 10 ? `\n  ... and ${convos.length - 10} more` : "";
+            addSystemMessage(
+              `Saved conversations:\n${list}${more}\n\nUse /load <name> to restore.`,
+            );
           }
           return;
         }
@@ -588,6 +689,14 @@ Cost Breakdown
         }
         setMessages(loaded);
         setTotalUsage({ inputTokens: 0, outputTokens: 0, totalCost: 0 });
+        // Restore the model from the last assistant message
+        const lastModel = [...loaded]
+          .reverse()
+          .find((m) => m.role === "assistant" && m.model)?.model;
+        if (lastModel) {
+          setCurrentModel(lastModel);
+          resetClients();
+        }
         setInfo("conversation loaded");
         return;
       }
@@ -694,6 +803,14 @@ Use /config save to persist current settings.`);
         }
         if (!existsSync(absPath)) {
           setError(`File not found: ${imagePath}`);
+          return;
+        }
+
+        // Enforce 10MB size limit to prevent OOM
+        const MAX_IMAGE_SIZE = 10 * 1024 * 1024;
+        const imgStat = statSync(absPath);
+        if (imgStat.size > MAX_IMAGE_SIZE) {
+          setError(`Image too large (${Math.round(imgStat.size / 1024 / 1024)}MB, max 10MB).`);
           return;
         }
 
@@ -829,13 +946,45 @@ Use /config save to persist current settings.`);
         return;
       }
 
+      if (trimmed === "/mood" || trimmed.startsWith("/mood ")) {
+        const arg = trimmed.slice("/mood".length).trim().toLowerCase();
+        if (!arg) {
+          const moodList = Object.keys(MOOD_PRESETS)
+            .map((m) => `  ${m}${m === currentMood ? " (active)" : ""}`)
+            .join("\n");
+          addSystemMessage(
+            `${currentMood ? `Current mood: ${currentMood}` : "No mood set"}\n\nAvailable moods:\n${moodList}\n\nUsage: /mood <name> or /mood off`,
+          );
+          return;
+        }
+        if (arg === "off" || arg === "none") {
+          setCurrentMood(null);
+          addSystemMessage("Mood cleared. Back to normal.");
+          return;
+        }
+        if (!MOOD_PRESETS[arg]) {
+          setError(`Unknown mood "${arg}". Available: ${Object.keys(MOOD_PRESETS).join(", ")}`);
+          return;
+        }
+        setCurrentMood(arg);
+        addSystemMessage(`Mood set to ${arg}. Arr, let's go! (Use /mood off to disable)`);
+        return;
+      }
+
       if (trimmed === "/permissions" || trimmed.startsWith("/permissions ")) {
         const args = trimmed.slice("/permissions".length).trim().split(/\s+/);
 
         // List all permissions
         if (args.length === 0 || !args[0]) {
           const { getToolPermission } = await import("./lib/config.js");
-          const tools = ["read_file", "write_file", "list_dir", "search_files", "web_fetch"];
+          const tools = [
+            "read_file",
+            "write_file",
+            "list_dir",
+            "search_files",
+            "web_fetch",
+            "run_command",
+          ];
           const permissions = tools
             .map((tool) => `  ${tool.padEnd(15)} — ${getToolPermission(tool)}`)
             .join("\n");
@@ -849,7 +998,14 @@ Use /config save to persist current settings.`);
         // Set permission
         if (args.length === 2) {
           const [toolName, permission] = args;
-          const validTools = ["read_file", "write_file", "list_dir", "search_files", "web_fetch"];
+          const validTools = [
+            "read_file",
+            "write_file",
+            "list_dir",
+            "search_files",
+            "web_fetch",
+            "run_command",
+          ];
           const validPermissions = ["always", "ask", "never"];
 
           if (!validTools.includes(toolName!)) {
@@ -872,13 +1028,19 @@ Use /config save to persist current settings.`);
         return;
       }
 
-      if (trimmed === "/compact") {
+      if (trimmed === "/compact" || trimmed === "/compact confirm") {
         if (messages.length < 4) {
           setError("Not enough messages to compact.");
           return;
         }
+        if (trimmed === "/compact") {
+          addSystemMessage(
+            `This will replace all ${messages.length} messages with a summary.\nType /compact confirm to proceed.`,
+          );
+          return;
+        }
         const summaryRequest: ChatMessage[] = [
-          ...messages,
+          ...messages.filter((m) => !m.id.startsWith("system-")),
           {
             id: "compact-req",
             role: "user",
@@ -929,6 +1091,13 @@ Use /config save to persist current settings.`);
           setMessages(newMessages);
           persistSession(newMessages);
         }
+        return;
+      }
+
+      // === Easter eggs ===
+      const easterEgg = checkEasterEgg(trimmed);
+      if (easterEgg) {
+        addSystemMessage(easterEgg);
         return;
       }
 
@@ -995,7 +1164,7 @@ Use /config save to persist current settings.`);
         hasNewlines={inputValue.includes("\n")}
       />
       <StatusBar
-        messageCount={messages.length}
+        messageCount={messages.filter((m) => !m.id.startsWith("system-")).length}
         appState={appState}
         error={error}
         info={info}
