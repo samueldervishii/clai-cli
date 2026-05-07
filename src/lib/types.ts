@@ -18,7 +18,7 @@ export interface ChatMessage {
   images?: ChatImage[];
 }
 
-export type AppState = "idle" | "streaming" | "error";
+export type AppState = "idle" | "streaming" | "awaiting-approval" | "error";
 
 export interface TokenUsage {
   inputTokens: number;

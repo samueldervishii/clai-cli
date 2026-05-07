@@ -22,6 +22,8 @@ export function StatusBar({ messageCount, appState, error, info, totalUsage }: S
         </Text>
       ) : appState === "streaming" ? (
         <Text color={theme.accent}>Streaming response...</Text>
+      ) : appState === "awaiting-approval" ? (
+        <Text color={theme.accent}>Awaiting approval — press y to approve, n to deny</Text>
       ) : (
         <Text color={theme.dim}>
           {messageCount} message{messageCount !== 1 ? "s" : ""}
@@ -30,7 +32,12 @@ export function StatusBar({ messageCount, appState, error, info, totalUsage }: S
         </Text>
       )}
       <Text color={theme.dim}>
-        {appState === "streaming" ? "Esc to stop · " : "/help · "}Ctrl+C to exit
+        {appState === "streaming"
+          ? "Esc to stop · "
+          : appState === "awaiting-approval"
+            ? "y/n · Esc to deny · "
+            : "/help · "}
+        Ctrl+C to exit
       </Text>
     </Box>
   );

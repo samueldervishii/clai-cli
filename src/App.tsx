@@ -120,6 +120,30 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
   ".webp": "image/webp",
 };
 
+function buildApprovalPreview(name: string, input: Record<string, unknown>): string {
+  const str = (k: string, fallback = ""): string =>
+    typeof input[k] === "string" ? (input[k] as string) : fallback;
+  switch (name) {
+    case "run_command":
+      return `Run command: ${str("command")}`;
+    case "write_file": {
+      const content = str("content");
+      const preview = content.length > 200 ? content.slice(0, 200) + "..." : content;
+      return `Write file: ${str("path")}\n\n${preview}`;
+    }
+    case "read_file":
+      return `Read file: ${str("path")}`;
+    case "list_dir":
+      return `List directory: ${str("path", ".")}`;
+    case "search_files":
+      return `Search "${str("pattern")}" in: ${str("path", ".")}`;
+    case "web_fetch":
+      return `Fetch URL: ${str("url")}`;
+    default:
+      return `Run tool: ${name}`;
+  }
+}
+
 interface AppProps {
   initialMessage?: string;
 }
@@ -161,6 +185,10 @@ export function App({ initialMessage }: AppProps) {
   const [currentMood, setCurrentMood] = useState<string | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [pendingApproval, setPendingApproval] = useState<{
+    approve: () => void;
+    deny: () => void;
+  } | null>(null);
   const savedInputRef = useRef("");
   const abortRef = useRef<AbortController | null>(null);
   const messagesRef = useRef<ChatMessage[]>([]);
@@ -223,6 +251,14 @@ export function App({ initialMessage }: AppProps) {
     }
     if (key.escape && appState === "streaming") {
       abortRef.current?.abort();
+    }
+    if (appState === "awaiting-approval" && pendingApproval) {
+      if (_input === "y" || _input === "Y" || key.return) {
+        pendingApproval.approve();
+      } else if (_input === "n" || _input === "N" || key.escape) {
+        pendingApproval.deny();
+      }
+      return;
     }
     if (appState === "idle") {
       // Ctrl+Enter: add newline for multi-line input
@@ -343,16 +379,27 @@ export function App({ initialMessage }: AppProps) {
             }
             setStreamSegments([...localSegments]);
           } else if (event.type === "tool_approve") {
-            if (event.tool.name === "run_command") {
-              const cmd = event.tool.input.command as string;
-              addSystemMessage(`Run command: ${cmd}\n\nApproved automatically.`);
-            } else {
-              const path = event.tool.input.path as string;
-              const content = event.tool.input.content as string;
-              const preview = content.length > 200 ? content.slice(0, 200) + "..." : content;
-              addSystemMessage(`Write file: ${path}\n\n${preview}\n\nApproved automatically.`);
-            }
-            event.approve();
+            const preview = buildApprovalPreview(event.tool.name, event.tool.input);
+            addSystemMessage(`${preview}\n\nApprove? (y/n)`);
+            setAppState("awaiting-approval");
+            await new Promise<void>((resolveWait) => {
+              setPendingApproval({
+                approve: () => {
+                  event.approve();
+                  setPendingApproval(null);
+                  setAppState("streaming");
+                  addSystemMessage("Approved.");
+                  resolveWait();
+                },
+                deny: () => {
+                  event.deny();
+                  setPendingApproval(null);
+                  setAppState("streaming");
+                  addSystemMessage("Denied.");
+                  resolveWait();
+                },
+              });
+            });
           } else if (event.type === "warning") {
             setError(event.message);
           }
@@ -1160,7 +1207,7 @@ Use /config save to persist current settings.`);
         value={inputValue}
         onChange={handleInputChange}
         onSubmit={handleSubmit}
-        isDisabled={appState === "streaming"}
+        isDisabled={appState === "streaming" || appState === "awaiting-approval"}
         hasNewlines={inputValue.includes("\n")}
       />
       <StatusBar
